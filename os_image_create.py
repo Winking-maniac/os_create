@@ -79,11 +79,28 @@ message:
 
 
 def run_module():
+    class _const:
+        class ConstError(TypeError): pass
+        def __setattr__(self,name,value):
+            if self.__dict__.has_key(name):
+                raise self.ConstError("Can't rebind const value \"" + name + '"')
+    # Error messages
+    _const.SOURCES_ERR_MSG = "Exact one source should be determined from the list below: file, url, volume"
+    _const.PROJECT_DOMAIN_ERR_MSG = "Project domain should be determined with project"
+    _const.SHARE_POLICY_ERR_MSG = "No more than one share policy should be determined from the list below: public, shared, private, community"
+    _const.MKDIR_ERR_MSG = "Failed to create tmp directory"
+    _const.MOUNT_NAME_ERR_MSG = "Can't mount temporary filesystem: is there another instance of module with same image name?"
+    _const.MOUNT_ERR_MSG = "Failed to mount temporary filesystem"
+    _const.OPENSTACK_CONNECT_ERR_MSG = 'Unable to connect to OpenStack'
+    _const.OPENSTACK_CREATE_ERR_MSG = 'Unable to create image: '
+
+
     # define available arguments/parameters a user can pass to the module
     module_args = dict(
         name=dict(type='str', required=True),
         file=dict(type='str', required=False, default=""),
         url=dict(type='str', required=False, default=""),
+        tmp_path=dict(type='path', required=False, default="/tmp/os_image_create_tmp"),
         retries_num=dict(type='int', required=False, default=5),
         id=dict(type='str', required=False, default=""),
         protected=dict(type='bool', required=False, default=False),
@@ -102,36 +119,25 @@ def run_module():
         tags=dict(type='list', required=False, default=list())
     )
 
-    # seed the result dict in the object
-    # we primarily care about changed and state
-    # changed is if this module effectively modified the target
-    # state will include any data that you want your module to pass back
-    # for consumption, for example, in a subsequent task
     result = dict(
         changed=False,
     )
 
-    # the AnsibleModule object will be our abstraction working with Ansible
-    # this includes instantiation, a couple of common attr would be the
-    # args/params passed to the execution, as well as if the module
-    # supports check mode
     module = AnsibleModule(
         argument_spec=module_args,
         supports_check_mode=True
     )
 
-    # if the user is working with this module in only check mode we do not
-    # want to make any changes to the environment, just return the current
-    # state with no modifications
     if module.check_mode:
         module.exit_json(**result)
 
-    # manipulate or modify the state as needed (this is going to be the
-    # part where your module will do what it needs to do)
+    retries_num = module.params['retries_num']
+    _const.DOWNLOAD_ERR_MSG = 'Unable to get remote image in ' + str(retries_num) + ' attempts'
+
     name = module.params['name']
     file = module.params['file']
     url = module.params['url']
-    retries_num = module.params['retries_num']
+    tmp_path = module.params['tmp_path']
     id = module.params['id']
     protected = module.params['protected']
     public = module.params['public']
@@ -158,16 +164,16 @@ def run_module():
         image_attrs['filename'] = file
         sources += 1
     if url != '':
-        image_attrs['filename'] = r'/tmp/os_create_tmp/'+name+'/'+name
+        image_attrs['filename'] = tmp_path + '/' + name + '/' + name
         sources += 1
     if volume != '':
         image_attrs['volume'] = volume
         sources += 1
     if sources != 1:
-        module.fail_json(msg="Exact one source should be determined from the list below: file, url, volume", **result)
+        module.fail_json(msg=_const.SOURCES_ERR_MSG, **result)
 
     if project_domain != "" and project == "":
-        module.fail_json(msg="Project domain should be determined with project", **result)
+        module.fail_json(msg=_const.PROJECT_DOMAIN_ERR_MSG, **result)
 
     share_policy = 0
     if shared is True:
@@ -182,8 +188,8 @@ def run_module():
     if community is True:
         image_attrs['community'] = True
         share_policy += 1
-    if share_policy != 1:
-        module.fail_json(msg="Exact one share policy should be determined from the list below: public, shared, private, community", **result)
+    if share_policy > 1:
+        module.fail_json(msg=_const.SHARE_POLICY_ERR_MSG, **result)
 
     if id != '':
         image_attrs['id'] = id
@@ -212,11 +218,11 @@ def run_module():
     if url != "":
 
         try:
-            sh.mkdir("/tmp/os_create_tmp/"+name, "-p")
+            sh.mkdir(tmp_path + "/" + name, "-p")
         except sh.ErrorReturnCode_1:
             pass
         except sh.ErrorReturnCode:
-            module.fail_json(msg="Failed to create tmp directory", **result)
+            module.fail_json(msg=_const.MKDIR_ERR_MSG, **result)
 
         # Try getting header of remote image
 
@@ -229,13 +235,12 @@ def run_module():
             time.sleep(1)
 
         if header_failed:
-            module.fail_json(msg='Unable to get remote image in ' +
-            str(retries_num) + ' attempts', **result)
+            module.fail_json(msg=_const.DOWNLOAD_ERR_MSG, **result)
 
         # Check we are the only instance
         grep_out = 0
         try:
-            grep_out = sh.grep(sh.df(), "/tmp/os_create_tmp/"+name, "-c")
+            grep_out = sh.grep(sh.df(), tmp_path + "/" + name, "-c")
         except sh.ErrorReturnCode_1:
             grep_out = 1
         except:
@@ -243,15 +248,14 @@ def run_module():
             msg="", **result)
         if grep_out == 0:
             module.fail_json(
-            msg="Can't mount temporary filesystem: is there another instance of module with same image name?", **result)
+            msg=_const.MOUNT_NAME_ERR_MSG, **result)
 
         # Mounting temporary filesystem
         try:
-            # with sh.contrib.sudo:
-            sh.mount("tmpfs", "/tmp/os_create_tmp/"+name, t="tmpfs",
+            sh.mount("tmpfs", tmp_path + "/" + name, t="tmpfs",
                     o="size="+str(1000000 + int(remote_image.headers['Content-length'])))
             # Downloading image
-            with open(r'/tmp/os_create_tmp/'+name+'/'+name, "wb") as local_image:
+            with open(tmp_path + '/' + name + '/' + name, "wb") as local_image:
                 with Bar('Downloading', max=int(remote_image.headers['Content-length']), suffix='%(percent).1f%% - %(eta)ds') as bar:
                     for chunk in remote_image.iter_content(chunk_size=1000):
                         bar.next(n=len(chunk))
@@ -260,44 +264,28 @@ def run_module():
             try:
                 conn = openstack.connection.from_config(cloud="openstack")
             except:
-                sh.umount("/tmp/os_create_tmp/"+name)
-                module.fail_json(msg='Unable to connect to OpenStack', **result)
+                sh.umount(tmp_path + "/" + name)
+                module.fail_json(msg=_const.OPENSTACK_CONNECT_ERR_MSG, **result)
 
             # Upload the image.
             with Spinner("Uploading to OpenStack... "):
                 try:
                     conn.image.create_image(**image_attrs)
                 except Exception as e:
-                    sh.umount(r"/tmp/os_create_tmp/"+name)
-                    module.fail_json(msg='Unable to create image: '+str(e), **result)
-            # with sh.contrib.sudo:
+                    sh.umount(tmp_path + "/" + name)
+                    module.fail_json(msg=_const.OPENSTACK_CREATE_ERR_MSG + str(e), **result)
         except sh.ErrorReturnCode:
-            sh.umount(r"/tmp/os_create_tmp/"+name)
-            module.fail_json(msg="Failed to mount temporary filesystem", **result)
+            sh.umount(tmp_path + "/" + name)
+            module.fail_json(msg=_const.MOUNT_ERR_MSG, **result)
     else:
         with Spinner("Uploading to OpenStack... "):
             try:
                 conn.image.create_image(**image_attrs)
             except Exception as e:
-                module.fail_json(msg='Unable to create image: ' + str(e), **result)
+                module.fail_json(msg=_const.OPENSTACK_CREATE_ERR_MSG + str(e), **result)
 
-    # result['original_message'] = module.params['url']
     result['message'] = 'Successfully uploaded an image'
-
-    # use whatever logic you need to determine whether or not this module
-    # made any modifications to your target
-    # if module.params['new']:
     result['changed'] = True
-
-    # during the execution of the module, if there is an exception or a
-    # conditional state that effectively causes a failure, run
-    # AnsibleModule.fail_json() to pass in the message and the result
-
-    # if module.params['name'] == 'fail me':
-    # module.fail_json(msg='You requested this to fail', **result)
-
-    # in the event of a successful module execution, you will want to
-    # simple AnsibleModule.exit_json(), passing the key/value results
     module.exit_json(**result)
 
 
