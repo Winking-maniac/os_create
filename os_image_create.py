@@ -12,6 +12,12 @@ import requests
 from ansible.module_utils.basic import AnsibleModule
 __metaclass__ = type
 import time
+from ansible_collections.openstack.cloud.plugins.module_utils.openstack import (openstack_full_argument_spec,
+                                                                                openstack_module_kwargs,
+                                                                                openstack_cloud_from_module)
+
+# import sys
+# import threading
 
 DOCUMENTATION = r'''
 ---
@@ -84,6 +90,10 @@ def run_module():
         def __setattr__(self,name,value):
             if self.__dict__.has_key(name):
                 raise self.ConstError("Can't rebind const value \"" + name + '"')
+    # def spin_cursor():
+    #     while True:
+    #         for cursor in "|/-\\":
+    #             yield cursor
     # Error messages
     _const.SOURCES_ERR_MSG = "Exact one source should be determined from the list below: file, url, volume"
     _const.PROJECT_DOMAIN_ERR_MSG = "Project domain should be determined with project"
@@ -93,11 +103,15 @@ def run_module():
     _const.MOUNT_ERR_MSG = "Failed to mount temporary filesystem"
     _const.OPENSTACK_CONNECT_ERR_MSG = 'Unable to connect to OpenStack'
     _const.OPENSTACK_CREATE_ERR_MSG = 'Unable to create image: '
+    _const.DOWNLOAD_ERR_MSG = 'Unable to get remote image: '
+
 
 
     # define available arguments/parameters a user can pass to the module
-    module_args = dict(
+    # argument_spec = openstack_full_argument_spec(
+    module_args = openstack_full_argument_spec(
         name=dict(type='str', required=True),
+        in_memory=dict(type='bool', required=False, default=False),
         file=dict(type='str', required=False, default=""),
         url=dict(type='str', required=False, default=""),
         tmp_path=dict(type='path', required=False, default="/tmp/os_image_create_tmp"),
@@ -132,7 +146,7 @@ def run_module():
         module.exit_json(**result)
 
     retries_num = module.params['retries_num']
-    _const.DOWNLOAD_ERR_MSG = 'Unable to get remote image in ' + str(retries_num) + ' attempts'
+    _const.DOWNLOAD_RETRIES_ERR_MSG = 'Unable to get remote image in ' + str(retries_num) + ' attempts'
 
     name = module.params['name']
     file = module.params['file']
@@ -215,10 +229,20 @@ def run_module():
         image_attrs['tags'] = module.params['tags']
 
 
+    try:
+        # Establishing connection to OpenStack
+        sdk, cloud = openstack_cloud_from_module(module)
+        # conn = openstack.connection.from_config(cloud="openstack")
+    except:
+        # sh.umount(tmp_path + "/" + name)
+        module.fail_json(msg=_const.OPENSTACK_CONNECT_ERR_MSG, **result)
+
+
     if url != "":
 
         try:
             sh.mkdir(tmp_path + "/" + name, "-p")
+            # print(tmp_path + "/" + name)
         except sh.ErrorReturnCode_1:
             pass
         except sh.ErrorReturnCode:
@@ -228,14 +252,17 @@ def run_module():
 
         header_failed = True
         for i in range(retries_num):
-            remote_image = requests.get(url, stream=True)
+            try:
+                remote_image = requests.get(url, stream=True)
+            except requests.RequestException as e:
+                module.fail_json(msg=_const.DOWNLOAD_ERR_MSG + str(e), **result)
             if remote_image.ok:
                 header_failed = False
                 break
             time.sleep(1)
 
         if header_failed:
-            module.fail_json(msg=_const.DOWNLOAD_ERR_MSG, **result)
+            module.fail_json(msg=_const.DOWNLOAD_RETRIES_ERR_MSG, **result)
 
         # Check we are the only instance
         grep_out = 0
@@ -249,34 +276,36 @@ def run_module():
         if grep_out == 0:
             module.fail_json(
             msg=_const.MOUNT_NAME_ERR_MSG, **result)
-
         # Mounting temporary filesystem
         try:
-            sh.mount("tmpfs", tmp_path + "/" + name, t="tmpfs",
-                    o="size="+str(1000000 + int(remote_image.headers['Content-length'])))
+            if module.params["in_memory"]:
+                sh.mount("tmpfs", tmp_path + "/" + name, t="tmpfs",
+                            o="size="+str(1000000 + int(remote_image.headers['Content-length'])))
             # Downloading image
             with open(tmp_path + '/' + name + '/' + name, "wb") as local_image:
                 with Bar('Downloading', max=int(remote_image.headers['Content-length']), suffix='%(percent).1f%% - %(eta)ds') as bar:
                     for chunk in remote_image.iter_content(chunk_size=1000):
                         bar.next(n=len(chunk))
                         local_image.write(chunk)
-            # Establishing connection to OpenStack
-            try:
-                conn = openstack.connection.from_config(cloud="openstack")
-            except:
-                sh.umount(tmp_path + "/" + name)
-                module.fail_json(msg=_const.OPENSTACK_CONNECT_ERR_MSG, **result)
 
             # Upload the image.
             with Spinner("Uploading to OpenStack... "):
                 try:
-                    conn.image.create_image(**image_attrs)
+                    cloud.create_image(**image_attrs)
+                    # conn.image.create_image(**image_attrs)
                 except Exception as e:
-                    sh.umount(tmp_path + "/" + name)
+                    # sh.umount(tmp_path + "/" + name)
                     module.fail_json(msg=_const.OPENSTACK_CREATE_ERR_MSG + str(e), **result)
         except sh.ErrorReturnCode:
-            sh.umount(tmp_path + "/" + name)
+            # sh.umount(tmp_path + "/" + name)
             module.fail_json(msg=_const.MOUNT_ERR_MSG, **result)
+        finally:
+            # with sh.contrib.sudo:
+            if module.params["in_memory"]:
+                sh.umount(tmp_path + "/" + name)
+            else:
+                sh.rm("-r", tmp_path + "/" + name)
+
     else:
         with Spinner("Uploading to OpenStack... "):
             try:
